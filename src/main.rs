@@ -1,14 +1,21 @@
 use std::{
     env::current_dir,
-    fs::{create_dir, File},
+    fs::{create_dir, create_dir_all, File},
     io::{Read, Write},
     path::{Path, PathBuf},
+    process,
 };
 
 use anyhow::Context;
-use clap::{arg, Args, Command, Parser, Subcommand};
-use rcgen::{Certificate, CertificateParams, DistinguishedName, IsCa, KeyPair, SanType};
+use clap::{arg, Args, Parser, Subcommand};
+use directories::ProjectDirs;
+use rcgen::{Certificate, CertificateParams, KeyPair};
 use rustyline::DefaultEditor;
+use serde::{Deserialize, Serialize};
+use utils::prompt_question;
+
+mod cert_sign_request;
+mod utils;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -16,48 +23,196 @@ use rustyline::DefaultEditor;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    /// the config file.
+    #[arg(long, short)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    non_interactive: bool,
+    #[arg(long, short)]
+    force: bool,
+    #[arg(long)]
+    dn_file: Option<PathBuf>,
+    #[arg(long)]
+    san_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
     Ca(CaArgs),
-    Server(ServerArgs),
+    Certs(Certsargs),
 }
 
 #[derive(Args, Debug)]
 struct CaArgs {
-    ca_dir: PathBuf,
+    #[arg(long)]
+    ca_dir: Option<PathBuf>,
     #[arg(long)]
     gen: bool,
 }
 
 #[derive(Args, Debug)]
-struct ServerArgs {
-    ca_dir: PathBuf,
+struct Certsargs {
+    /// Output dir
     #[arg(long)]
     out: Option<PathBuf>,
+    #[arg(long)]
+    self_signed: bool,
     name: String,
+    ca_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Config {
+    pub ca: CaConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CaConfig {
+    default_ca_path: PathBuf,
+
+    vality_time_days: i64,
+}
+
+fn create_default_config(dirs: &ProjectDirs) -> Config {
+    Config {
+        ca: CaConfig {
+            default_ca_path: dirs.data_dir().join("ca"),
+            vality_time_days: 365,
+        },
+    }
+}
+
+fn read_config(app: &ProjectDirs, cli: &Cli) -> anyhow::Result<Config> {
+    if let Some(user_config_path) = &cli.config {
+        if user_config_path.exists() {
+            let mut str = String::new();
+            File::open(user_config_path)
+                .with_context(|| format!("can't open {user_config_path:?}"))?
+                .read_to_string(&mut str)
+                .with_context(|| format!("Can't read {user_config_path:?}"))?;
+            toml::from_str::<Config>(&str).with_context(|| {
+                format!("Can't parse file {user_config_path:?}")
+            })
+        } else {
+            eprintln!("can't find file {user_config_path:?}");
+            process::exit(1)
+        }
+    } else {
+        let config_path = app.config_dir().join("config.toml");
+        if config_path.exists() {
+            let mut str = String::new();
+            File::open(&config_path)
+                .with_context(|| format!("can't open {config_path:?}"))?
+                .read_to_string(&mut str)
+                .with_context(|| format!("Can't read {config_path:?}"))?;
+            toml::from_str::<Config>(&str)
+                .with_context(|| format!("Can't parse file {config_path:?}"))
+        } else {
+            let config = create_default_config(app);
+            create_dir_all(app.config_dir())
+                .context("Can't create config dir")?;
+            File::create(&config_path)
+                .with_context(|| format!("Can't create file {config_path:?}"))?
+                .write_all(toml::to_string_pretty(&config)?.as_bytes())
+                .with_context(|| format!("Can't write file {config_path:?}"))?;
+            Ok(config)
+        }
+    }
+}
+
+pub struct RunPlan {
+    pub ca_or_cert: bool,
+    pub generate_or_show: bool,
+    pub user_read_dn: bool,
+    pub dn_file: Option<PathBuf>,
+    pub write_dn: bool,
+    pub user_read_san: bool,
+    pub san_file: Option<PathBuf>,
+    pub write_san: bool,
+    pub overwrite: bool,
+    pub expiry_days: i64,
+}
+
+impl Default for RunPlan {
+    fn default() -> Self {
+        Self {
+            ca_or_cert: false,
+            generate_or_show: false,
+            user_read_dn: true,
+            dn_file: None,
+            write_dn: true,
+            user_read_san: true,
+            san_file: None,
+            write_san: true,
+            overwrite: false,
+            expiry_days: 7300,
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
+    let mut plan = RunPlan::default();
+    let app = ProjectDirs::from("com", "mc1472", "certman").unwrap();
     let cli = Cli::parse();
+
+
+    let config = read_config(&app, &cli)?;
+
+    plan.user_read_dn = !cli.non_interactive;
+    plan.user_read_san = !cli.non_interactive;
+    plan.overwrite = cli.force;
+    plan.dn_file = cli.dn_file;
+    plan.san_file = cli.san_file;
+
+    plan.expiry_days = config.ca.vality_time_days;
+    let mut rl = DefaultEditor::new()?;
 
     match cli.command {
         Commands::Ca(args) => {
+            let ca_dir = args.ca_dir.unwrap_or(config.ca.default_ca_path);
+            plan.generate_or_show = args.gen;
+            plan.ca_or_cert = true;
             if args.gen {
-                create_dir(&args.ca_dir)?;
-                let cert = create_cert(true)?;
-                save_cert(args.ca_dir, "ca_cert", cert, None)?;
+                create_dir_all(&ca_dir)?;
+                if ca_dir.join("ca_cert.pem").exists() && !prompt_question(
+                        &mut rl,
+                        &format!(
+                        "A Certificate Autority already exists at {ca_dir:?}. Overwrite? (y/N) "
+                    ),
+                        "y",
+                    )? {
+                        eprintln!(
+                            "not Overwriting existing Certificate Autority"
+                        );
+                        process::exit(1);
+                    
+                }
+                let cert = create_cert(&plan, &mut rl)?;
+                save_cert(&ca_dir, "ca_cert", cert, None)?;
+            } else {
+                process::Command::new("openssl")
+                    .args(["x509", "-text", "-in"])
+                    .arg(ca_dir.join("ca_cert.pem"))
+                    .arg("-noout")
+                    .spawn()?
+                    .wait()?;
             }
         }
-        Commands::Server(args) => {
-            let ca = load_ca(args.ca_dir).context("can't load ca")?;
-            let cert = create_cert(false)?;
+        Commands::Certs(args) => {
+            plan.generate_or_show = true;
+            let ca = if args.self_signed {
+                None
+            } else if let Some(ca_dir) = args.ca_dir {
+                Some(load_ca(ca_dir)?)
+            } else {
+                Some(load_ca(&config.ca.default_ca_path)?)
+            };
+            let cert = create_cert(&plan, &mut rl)?;
             if let Some(out_dir) = args.out {
                 create_dir(&out_dir)?;
-                save_cert(out_dir, &args.name, cert, Some(ca))?;
+                save_cert(out_dir, &args.name, cert, ca)?;
             } else {
-                save_cert(current_dir()?, &args.name, cert, Some(ca))?;
+                save_cert(current_dir()?, &args.name, cert, ca)?;
             }
         }
     }
@@ -98,8 +253,12 @@ fn save_cert<P: AsRef<Path>>(
     Ok(())
 }
 
-fn create_cert(is_ca: bool) -> anyhow::Result<Certificate> {
-    let csr = create_csr(is_ca).context("can't create csr")?;
+fn create_cert(
+    config: &RunPlan,
+    rl: &mut DefaultEditor,
+) -> anyhow::Result<Certificate> {
+    let csr = cert_sign_request::create_csr(config, rl)
+        .context("can't create csr")?;
     let cert = Certificate::from_params(csr).context("can't create cert")?;
     Ok(cert)
 }
@@ -128,59 +287,4 @@ fn load_ca<P: AsRef<Path>>(ca_dir: P) -> anyhow::Result<Certificate> {
         .with_context(|| format!("can't read {:?}", &cert_path))?;
     let cert_prams = CertificateParams::from_ca_cert_pem(&cert, key_pair)?;
     Ok(Certificate::from_params(cert_prams)?)
-}
-
-// println!("Hello, world!");
-// let csr = create_csr()?;
-// let cert = Certificate::from_params(csr)?;
-// let pem = cert.serialize_pem()?;
-// let mut file = File::options()
-//     .create(true)
-//     .write(true)
-//     .truncate(true)
-//     .open("./ca_cert.pem")?;
-// file.write(pem.as_bytes())?;
-
-fn create_csr(is_ca: bool) -> anyhow::Result<CertificateParams> {
-    let mut rl = DefaultEditor::new()?;
-    let mut csr = CertificateParams::default();
-
-    let dn = get_dn(&mut rl)?;
-    if is_ca {
-        csr.is_ca = IsCa::Ca(rcgen::BasicConstraints::Constrained(1));
-    } else {
-        let san = get_subject_alt_names(&mut rl)?;
-        csr.subject_alt_names = san;
-    }
-
-    csr.distinguished_name = dn;
-
-    Ok(csr)
-}
-
-fn get_dn(rl: &mut DefaultEditor) -> anyhow::Result<DistinguishedName> {
-    let mut dn = DistinguishedName::new();
-
-    let country = rl.readline("Country > ")?;
-    dn.push(rcgen::DnType::CountryName, country);
-    let state_or_province = rl.readline("State or Province > ")?;
-    dn.push(rcgen::DnType::StateOrProvinceName, state_or_province);
-    let locality = rl.readline("Locality > ")?;
-    dn.push(rcgen::DnType::LocalityName, locality);
-    let org = rl.readline("Orgiazation > ")?;
-    dn.push(rcgen::DnType::OrganizationName, org);
-    let common_name = rl.readline("Common Name > ")?;
-    dn.push(rcgen::DnType::CommonName, common_name);
-
-    Ok(dn)
-}
-
-fn get_subject_alt_names(rl: &mut DefaultEditor) -> anyhow::Result<Vec<SanType>> {
-    let subject_alt_name = rl
-        .readline("Subject alt names (comma seperated) > ")?
-        .split(",")
-        .map(|dns| SanType::DnsName(dns.to_owned()))
-        .collect::<Vec<_>>();
-
-    Ok(subject_alt_name)
 }

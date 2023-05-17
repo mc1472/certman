@@ -1,3 +1,5 @@
 /target
 *.pem
 *.key
+test*
+_vimrc_local.vim
