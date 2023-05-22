@@ -146,6 +146,7 @@ dependencies = [
  "rcgen",
  "rustyline",
  "serde",
+ "thiserror",
  "time",
  "toml",
 ]

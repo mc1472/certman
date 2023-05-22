@@ -120,6 +120,7 @@ fn read_config(app: &ProjectDirs, cli: &Cli) -> anyhow::Result<Config> {
     }
 }
 
+#[derive(Debug)]
 pub struct RunPlan {
     pub ca_or_cert: bool,
     pub generate_or_show: bool,
@@ -155,7 +156,6 @@ fn main() -> anyhow::Result<()> {
     let app = ProjectDirs::from("com", "mc1472", "certman").unwrap();
     let cli = Cli::parse();
 
-
     let config = read_config(&app, &cli)?;
 
     plan.user_read_dn = !cli.non_interactive;
@@ -185,7 +185,6 @@ fn main() -> anyhow::Result<()> {
                             "not Overwriting existing Certificate Autority"
                         );
                         process::exit(1);
-                    
                 }
                 let cert = create_cert(&plan, &mut rl)?;
                 save_cert(&ca_dir, "ca_cert", cert, None)?;
@@ -214,6 +213,12 @@ fn main() -> anyhow::Result<()> {
             } else {
                 save_cert(current_dir()?, &args.name, cert, ca)?;
             }
+            process::Command::new("openssl")
+                .args(["x509", "-text", "-in"])
+                .arg(current_dir()?.join("test.pem"))
+                .arg("-noout")
+                .spawn()?
+                .wait()?;
         }
     }
 
