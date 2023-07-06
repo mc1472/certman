@@ -4,37 +4,41 @@ use std::{
     net::IpAddr,
 };
 
+use anyhow::Context;
 use rcgen::SanType;
 use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
 
-use super::CertError;
-use crate::RunPlan;
+use crate::cli::CertPlan;
 
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct SanFile {
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SanFile {
     dns: Option<Vec<String>>,
     ip: Option<Vec<IpAddr>>,
     email: Option<Vec<String>>,
     uri: Option<Vec<String>>,
 }
 
-impl SanFile {
-    fn into_san_type(self) -> Vec<SanType> {
+impl From<SanFile> for Vec<SanType> {
+    fn from(value: SanFile) -> Self {
         let mut san = Vec::new();
-        self.dns
+        value
+            .dns
             .map(|dns| dns.into_iter().map(SanType::DnsName))
             .into_iter()
             .for_each(|val| san.extend(val));
-        self.ip
+        value
+            .ip
             .map(|ip| ip.into_iter().map(SanType::IpAddress))
             .into_iter()
             .for_each(|val| san.extend(val));
-        self.email
+        value
+            .email
             .map(|dns| dns.into_iter().map(SanType::Rfc822Name))
             .into_iter()
             .for_each(|val| san.extend(val));
-        self.uri
+        value
+            .uri
             .map(|dns| dns.into_iter().map(SanType::URI))
             .into_iter()
             .for_each(|val| san.extend(val));
@@ -42,54 +46,48 @@ impl SanFile {
     }
 }
 
-pub fn get_sans(
-    rl: &mut DefaultEditor,
-    plan: &RunPlan,
-) -> Result<Vec<SanType>, CertError> {
-    if let Some(san_file_path) = &plan.san_file {
-        if san_file_path.exists() {
-            let mut data = String::new();
-            File::open(san_file_path)?.read_to_string(&mut data)?;
-            let table: SanFile = toml::from_str(&data)?;
-            Ok(table.into_san_type())
-        } else if plan.user_read_san {
-            let dns_san = get_subject_alt_names_interactive(rl)?;
-            let san = SanFile {
-                dns: Some(dns_san),
-                ..Default::default()
-            };
-            if plan.write_san {
-                let data = toml::to_string_pretty(&san)?;
-                File::create(san_file_path)?.write_all(data.as_bytes())?;
-            }
-            Ok(san.into_san_type())
-        } else {
-            Err(CertError::InvalidPlan(
-                "san file not found and user input disabled",
-            ))
-        }
-    } else if plan.user_read_san {
-        let dns_san = get_subject_alt_names_interactive(rl)?;
-        let san = SanFile {
-            dns: Some(dns_san),
-            ..Default::default()
-        };
-        Ok(san.into_san_type())
+pub fn get_san_file(plan: &CertPlan) -> anyhow::Result<SanFile> {
+    let path = plan.output_path.join(&plan.name).with_extension("san.toml");
+    if path.exists() {
+        let mut data = String::new();
+        File::open(&path)?.read_to_string(&mut data)?;
+        toml::from_str(&data)
+            .with_context(|| format!("Can't parse san file from file {path:?}"))
     } else {
-        Err(CertError::InvalidPlan(
-            "san file not found and user input disabled",
-        ))
+        anyhow::bail!("san file doesn't exist")
     }
 }
 
-fn get_subject_alt_names_interactive(
+pub fn write_san_file(plan: &CertPlan, san: &SanFile) -> anyhow::Result<()> {
+    let path = plan.output_path.join(&plan.name).with_extension("san.toml");
+    if let Some(file_dn) = get_san_file(plan).ok() {
+        if san == &file_dn {
+            return Ok(());
+        }
+    }
+    if path.exists() && !plan.force {
+        return Ok(());
+    }
+    let data = toml::to_string_pretty(san)?;
+    File::create(&path)?.write_all(data.as_bytes())?;
+    Ok(())
+}
+
+pub fn get_san_interactive(
+    plan: &CertPlan,
     rl: &mut DefaultEditor,
-) -> Result<Vec<String>, CertError> {
+) -> anyhow::Result<SanFile> {
+    if !plan.interactive {
+        anyhow::bail!("interaction disabled");
+    }
     let subject_alt_name = rl
         .readline("Subject alt names (comma seperated) > ")?
         .split(',')
         .map(|dns| dns.to_owned())
         .collect::<Vec<_>>();
 
-    Ok(subject_alt_name)
+    Ok(SanFile {
+        dns: Some(subject_alt_name),
+        ..Default::default()
+    })
 }

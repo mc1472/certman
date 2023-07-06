@@ -3,14 +3,14 @@ use std::{
     io::{Read, Write},
 };
 
+use anyhow::Context;
 use rcgen::DistinguishedName;
 use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
 
-use super::CertError;
-use crate::RunPlan;
+use crate::cli::CertPlan;
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 pub struct DN {
     pub country: String,
     pub state_or_province: String,
@@ -33,40 +33,40 @@ impl From<DN> for DistinguishedName {
     }
 }
 
-pub fn get_dn(
-    rl: &mut DefaultEditor,
-    plan: &RunPlan,
-) -> Result<DistinguishedName, CertError> {
-    if let Some(dn_file_path) = &plan.dn_file {
-        if dn_file_path.exists() {
-            let mut string = String::new();
-            File::open(dn_file_path)?.read_to_string(&mut string)?;
-            toml::from_str::<DN>(&string)
-                .map_err(|err| err.into())
-                .map(|dn| dn.into())
-        } else if plan.user_read_dn {
-            let dn = get_dn_interactive(rl)?;
-            if plan.write_dn {
-                let data = toml::to_string_pretty(&dn)?;
-                File::create(dn_file_path)?.write_all(data.as_bytes())?;
-            }
-            Ok(dn.into())
-        } else {
-            Err(CertError::InvalidPlan(
-                "dn file not found and user input disabled",
-            ))
-        }
-    } else if plan.user_read_dn {
-        let dn = get_dn_interactive(rl)?;
-        Ok(dn.into())
+pub fn get_dn_file(plan: &CertPlan) -> anyhow::Result<DN> {
+    let path = plan.output_path.join(&plan.name).with_extension("dn.toml");
+    if path.exists() {
+        let mut data = String::new();
+        File::open(&path)?.read_to_string(&mut data)?;
+        toml::from_str(&data)
+            .with_context(|| format!("Can't parse dn from file {path:?}"))
     } else {
-        Err(CertError::InvalidPlan(
-            "dn file not found and user input disabled",
-        ))
+        anyhow::bail!("dn doesn't exist")
     }
 }
 
-pub fn get_dn_interactive(rl: &mut DefaultEditor) -> Result<DN, CertError> {
+pub fn write_dn_file(plan: &CertPlan, dn: &DN) -> anyhow::Result<()> {
+    let path = plan.output_path.join(&plan.name).with_extension("dn.toml");
+    if let Some(file_dn) = get_dn_file(plan).ok() {
+        if dn == &file_dn {
+            return Ok(());
+        }
+    }
+    if path.exists() && !plan.force {
+        return Ok(());
+    }
+    let data = toml::to_string_pretty(dn)?;
+    File::create(&path)?.write_all(data.as_bytes())?;
+    Ok(())
+}
+
+pub fn get_dn_interactive(
+    plan: &CertPlan,
+    rl: &mut DefaultEditor,
+) -> anyhow::Result<DN> {
+    if !plan.interactive {
+        anyhow::bail!("interaction disabled");
+    }
     let country = rl.readline("Country > ")?;
     let state_or_province = rl.readline("State or Province > ")?;
     let locality = rl.readline("Locality > ")?;
