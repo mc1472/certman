@@ -2,6 +2,7 @@
 name = "certman"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,3 +17,8 @@ serde = { version = "1.0.163", features = ["serde_derive"] }
 thiserror = "1.0.40"
 time = { version = "0.3.21", features = ["serde"] }
 toml = "0.7.3"
+
+
+[build-dependencies]
+clap = { version = "4.2.7", features = ["derive"] }
+clap_complete = "4.2"
